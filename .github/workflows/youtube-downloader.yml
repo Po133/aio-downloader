@@ -76,20 +76,16 @@ jobs:
         run: |
           TEMP_DIR=$(mktemp -d -t yt-dlp-XXXXXX)
           echo "TEMP_DIR=$TEMP_DIR" >> $GITHUB_OUTPUT
-          echo "✅ Created temp dir: $TEMP_DIR"
 
       - name: '🔐 Prepare cookies'
         run: |
           if [ -n "$YOUTUBE_COOKIES" ]; then
             echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
-            echo "✅ YouTube cookies written from secret."
-          else
-            echo "ℹ️ No YOUTUBE_COOKIES secret – proceeding without cookies."
           fi
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
-      - name: '📝 Parse all URLs and per‑URL arguments'
+      - name: '📝 Parse URLs'
         id: parse
         run: |
           INPUT="${{ github.event.inputs.url }}"
@@ -113,8 +109,7 @@ jobs:
                   i=$((i+1))
                 done
                 args_json=$(printf '%s\n' "${args[@]}" | jq -R . | jq -s .)
-                entry=$(jq -n --arg link "$link" --argjson args "$args_json" \
-                  '{link: $link, args: $args}')
+                entry=$(jq -n --arg link "$link" --argjson args "$args_json" '{link: $link, args: $args}')
                 ENTRIES=$(echo "$ENTRIES" | jq ". + [$entry]")
               else
                 i=$((i+1))
@@ -125,24 +120,18 @@ jobs:
           echo "ENTRIES_JSON=$ENTRIES_JSON" >> $GITHUB_OUTPUT
           IS_ANY_YT=$(echo "$ENTRIES" | jq '[.[].link | test("youtube\\.com/watch\\?v=|youtu\\.be/")] | any')
           echo "IS_ANY_YT=$IS_ANY_YT" >> $GITHUB_OUTPUT
-          echo "✅ Parsed $(echo "$ENTRIES" | jq length) entries"
 
-      - name: '📁 Prepare tool paths'
+      - name: '🛠️ Install tools'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
           mkdir -p ~/.local/bin
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
-
-      - name: '🛠️ Install download tools'
-        if: steps.parse.outputs.IS_ANY_YT == 'true'
-        run: |
           curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp
           chmod a+rx ~/.local/bin/yt-dlp
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq ffmpeg
           curl -fsSL https://deno.land/install.sh | sh -s -- -y
-          echo "✅ Tools installed"
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
       - name: '⬇️ Download videos with metadata and thumbnails'
         id: primary_download
@@ -191,9 +180,7 @@ jobs:
               fi
             fi
 
-            echo "========================================"
-            echo "📹 Processing: $link"
-            echo "🔧 Type: $type Quality: $val"
+            echo "Processing: $link (type=$type quality=$val)"
 
             YT_DLP_ARGS="$COOKIE_ARGS --js-runtimes deno --no-progress"
             VIDEO_JSON=$(yt-dlp $YT_DLP_ARGS -j "$link" 2>/dev/null) || {
@@ -201,31 +188,29 @@ jobs:
               continue
             }
 
-            # Save metadata to JSON
+            # Save metadata using jq (safe, no heredoc)
             if [ "$INCLUDE_METADATA" = "true" ]; then
               TITLE=$(echo "$VIDEO_JSON" | jq -r '.title // "Unknown"')
               SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c1-100)
               METADATA_FILE="${OUTPUT_FOLDER}/${SAFE_TITLE}_metadata.json"
               
-              cat > "$METADATA_FILE" << EOF
-{
-  "video_id": "$(echo "$VIDEO_JSON" | jq -r '.id // "unknown"')",
-  "title": $(echo "$TITLE" | jq -R -s '.'),
-  "description": $(echo "$VIDEO_JSON" | jq -r '.description // ""' | jq -R -s '.'),
-  "channel_name": $(echo "$VIDEO_JSON" | jq -r '.channel // .uploader // "Unknown"' | jq -R -s '.'),
-  "channel_url": "$(echo "$VIDEO_JSON" | jq -r '.channel_url // .uploader_url // ""')",
-  "tags": $(echo "$VIDEO_JSON" | jq -r '.tags // []' | jq '.'),
-  "duration_seconds": $(echo "$VIDEO_JSON" | jq -r '.duration // 0'),
-  "view_count": $(echo "$VIDEO_JSON" | jq -r '.view_count // 0'),
-  "like_count": $(echo "$VIDEO_JSON" | jq -r '.like_count // 0'),
-  "publish_date": "$(echo "$VIDEO_JSON" | jq -r '.upload_date // ""')",
-  "download_url": "$link",
-  "download_date": "$(date -Iseconds)",
-  "quality": "$val",
-  "type": "$type"
-}
-EOF
-              echo "✅ Metadata saved: $METADATA_FILE"
+              echo "$VIDEO_JSON" | jq '{ 
+                video_id: .id,
+                title: .title,
+                description: .description,
+                channel_name: (.channel // .uploader),
+                channel_url: (.channel_url // .uploader_url),
+                tags: .tags,
+                duration_seconds: .duration,
+                view_count: .view_count,
+                like_count: .like_count,
+                publish_date: .upload_date,
+                download_url: "'"$link"'",
+                download_date: "'"$(date -Iseconds)"'",
+                quality: "'"$val"'",
+                type: "'"$type"'"
+              }' > "$METADATA_FILE"
+              echo "Saved metadata: $METADATA_FILE"
             fi
 
             # Download thumbnail
@@ -235,22 +220,20 @@ EOF
                 TITLE=$(echo "$VIDEO_JSON" | jq -r '.title // "Unknown"')
                 SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c1-100)
                 THUMBNAIL_FILE="${OUTPUT_FOLDER}/${SAFE_TITLE}_thumbnail.jpg"
-                curl -L --fail -o "$THUMBNAIL_FILE" "$THUMBNAIL_URL" && echo "✅ Thumbnail saved"
+                curl -L --fail -o "$THUMBNAIL_FILE" "$THUMBNAIL_URL" && echo "Thumbnail saved"
               fi
             fi
 
-            # Download video/audio
+            # Download media
             if [ "$type" = "a" ]; then
               yt-dlp $YT_DLP_ARGS -f "bestaudio" \
                 -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" \
-                --extract-audio --audio-format mp3 --audio-quality "${val}k" "$link" || {
+                --extract-audio --audio-format mp3 --audio-quality "${val}k" "$link" || \
                 FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
-              }
             else
               yt-dlp $YT_DLP_ARGS -f "bestvideo[height<=${val}]+bestaudio/best[height<=${val}]" \
-                -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" "$link" || {
+                -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" "$link" || \
                 FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
-              }
             fi
           done
 
@@ -262,7 +245,6 @@ EOF
           FINAL_DIR="youtube"
           mkdir -p "$FINAL_DIR"
           mv "$TEMP_DIR"/* "$FINAL_DIR"/ 2>/dev/null || true
-          echo "📁 Files saved to $FINAL_DIR"
           ls -lah "$FINAL_DIR"
 
       - name: '📦 Create archives'
@@ -280,9 +262,8 @@ EOF
               [ -f "$f" ] && zip -j "${f}.zip" "$f" && rm "$f"
             done
           fi
-          echo "✅ Archive phase complete"
 
-      - name: '📤 Commit and push changes'
+      - name: '📤 Commit and push'
         if: ${{ github.event.inputs.upload_as_release == 'false' }}
         run: |
           git config user.name "github-actions[bot]"
