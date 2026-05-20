@@ -48,6 +48,14 @@ on:
         description: 'Upload files as a GitHub Release (uncheck = split push to repo)'
         type: boolean
         default: false
+      include_metadata:
+        description: 'Save video metadata (title, description, tags, channel) to JSON file'
+        type: boolean
+        default: true
+      include_thumbnail:
+        description: 'Download video thumbnail image'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -230,6 +238,71 @@ jobs:
               FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
               continue
             }
+
+            # ── Save metadata to JSON file (NEW) ──
+            if [ "${{ github.event.inputs.include_metadata }}" = "true" ]; then
+              echo "💾 Saving metadata to JSON..."
+              
+              # Extract metadata
+              TITLE=$(echo "$VIDEO_JSON" | jq -r '.title // "Unknown"')
+              DESCRIPTION=$(echo "$VIDEO_JSON" | jq -r '.description // ""')
+              CHANNEL=$(echo "$VIDEO_JSON" | jq -r '.channel // .uploader // "Unknown"')
+              TAGS=$(echo "$VIDEO_JSON" | jq -r '.tags // [] | join(",")')
+              VIDEO_ID=$(echo "$VIDEO_JSON" | jq -r '.id // "unknown"')
+              DURATION=$(echo "$VIDEO_JSON" | jq -r '.duration // 0')
+              VIEWS=$(echo "$VIDEO_JSON" | jq -r '.view_count // 0')
+              LIKE_COUNT=$(echo "$VIDEO_JSON" | jq -r '.like_count // 0')
+              PUBLISH_DATE=$(echo "$VIDEO_JSON" | jq -r '.upload_date // ""')
+              
+              # Create safe filename for metadata
+              SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | head -c 100)
+              METADATA_FILE="${OUTPUT_FOLDER}/${SAFE_TITLE}_metadata.json"
+              
+              # Create JSON metadata file
+              cat > "$METADATA_FILE" << EOF
+{
+  "video_id": "$VIDEO_ID",
+  "title": $(echo "$TITLE" | jq -R -s '.'),
+  "description": $(echo "$DESCRIPTION" | jq -R -s '.'),
+  "channel_name": $(echo "$CHANNEL" | jq -R -s '.'),
+  "channel_url": "$(echo "$VIDEO_JSON" | jq -r '.channel_url // .uploader_url // "")',
+  "tags": $(echo "$TAGS" | jq -R 'split(",")'),
+  "duration_seconds": $DURATION,
+  "view_count": $VIEWS,
+  "like_count": $LIKE_COUNT,
+  "publish_date": "$PUBLISH_DATE",
+  "download_url": "$link",
+  "download_date": "$(date -Iseconds)",
+  "quality": "$val",
+  "type": "$type"
+}
+EOF
+              echo "✅ Metadata saved to: $METADATA_FILE"
+            fi
+
+            # ── Download thumbnail (NEW) ──
+            if [ "${{ github.event.inputs.include_thumbnail }}" = "true" ]; then
+              echo "🖼️ Downloading thumbnail..."
+              
+              # Get thumbnail URL (highest quality available)
+              THUMBNAIL_URL=$(echo "$VIDEO_JSON" | jq -r '.thumbnails | sort_by(.height // 0, .width // 0) | last.url // ""')
+              
+              if [ -n "$THUMBNAIL_URL" ] && [ "$THUMBNAIL_URL" != "null" ]; then
+                TITLE=$(echo "$VIDEO_JSON" | jq -r '.title // "Unknown"')
+                SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | head -c 100)
+                THUMBNAIL_FILE="${OUTPUT_FOLDER}/${SAFE_TITLE}_thumbnail.jpg"
+                
+                # Download thumbnail
+                curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
+                  -o "$THUMBNAIL_FILE" "$THUMBNAIL_URL" && {
+                  echo "✅ Thumbnail saved to: $THUMBNAIL_FILE"
+                } || {
+                  echo "⚠️ Failed to download thumbnail"
+                }
+              else
+                echo "⚠️ No thumbnail URL found"
+              fi
+            fi
 
             if [ "$type" = "a" ]; then
               # ── Audio: select from audio-only formats ──
@@ -564,8 +637,8 @@ jobs:
               echo "✅ Already MP4: $(basename "$f")"
               continue
             fi
-            if [[ "$ext" =~ ^(m4a|mp3|ogg|opus)$ ]]; then
-              echo "🎵 Skipping audio file: $(basename "$f")"
+            if [[ "$ext" =~ ^(m4a|mp3|ogg|opus|json|jpg|jpeg|png)$ ]]; then
+              echo "⏭️ Skipping non-video file: $(basename "$f")"
               continue
             fi
             echo "🔧 Remuxing: $(basename "$f") → mp4"
@@ -594,161 +667,5 @@ jobs:
           # Move audio files (if any)
           mv "$TEMP_DIR"/*.m4a "$FINAL_DIR"/ 2>/dev/null || true
           mv "$TEMP_DIR"/*.mp3 "$FINAL_DIR"/ 2>/dev/null || true
-          echo "✅ Files moved to $FINAL_DIR (merged with existing content)"
-          echo "📁 Final contents of $FINAL_DIR:"
-          ls -lah "$FINAL_DIR"
-
-      # ── Zip all files (supports per‑file and bundled mode) ─
-      - name: '📦 Zip all files'
-        run: |
-          OUTPUT_FOLDER="youtube"
-          BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
-          UPLOAD_AS_RELEASE="${{ github.event.inputs.upload_as_release }}"
-          if [ "$UPLOAD_AS_RELEASE" = "true" ]; then
-            METHOD="release"
-          else
-            METHOD="split_push"
-          fi
-
-          if [ "$BUNDLE_ALL" = "true" ]; then
-            # ── Bundle mode: one ZIP containing all files ──
-            BUNDLE_TMP="bundle_tmp"
-            mkdir -p "$BUNDLE_TMP"
-            # Move all files from youtube into bundle_tmp
-            shopt -s dotglob nullglob
-            mv "$OUTPUT_FOLDER"/* "$BUNDLE_TMP"/ 2>/dev/null || true
-            shopt -u dotglob nullglob
-
-            if [ -z "$(ls -A "$BUNDLE_TMP" 2>/dev/null)" ]; then
-              echo "No files to bundle."
-              rm -rf "$BUNDLE_TMP"
-              exit 0
-            fi
-
-            RAND_BUNDLE=$(tr -dc 'a-z' </dev/urandom | head -c5)
-            BUNDLE_ZIP="youtube_bundle_${RAND_BUNDLE}.zip"
-            echo "📦 Creating bundle ZIP: $BUNDLE_ZIP"
-
-            if [ "$METHOD" = "release" ]; then
-              # Unsplit first, split if > 1950 MB
-              (cd "$BUNDLE_TMP" && zip -r "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-              FULLZIP="${OUTPUT_FOLDER}/${BUNDLE_ZIP}"
-              SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-              if [ "$SIZE" -gt 2044723200 ]; then
-                echo "Bundle ZIP larger than 1950 MiB, splitting"
-                rm "$FULLZIP"
-                (cd "$BUNDLE_TMP" && zip -r -s 1950m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-              fi
-            else
-              # split_push: always 99 MB parts
-              (cd "$BUNDLE_TMP" && zip -r -s 99m "../${OUTPUT_FOLDER}/${BUNDLE_ZIP}" *)
-            fi
-            rm -rf "$BUNDLE_TMP"
-          else
-            # ── Per‑file mode: one ZIP per file ──
-            for f in "$OUTPUT_FOLDER"/*; do
-              [ -f "$f" ] || continue
-              fname=$(basename "$f")
-              echo "🗜️ Zipping: $fname"
-              if [ "$METHOD" = "release" ]; then
-                zip -j "$OUTPUT_FOLDER/${fname}.zip" "$f"
-                FULLZIP="${OUTPUT_FOLDER}/${fname}.zip"
-                SIZE=$(stat -c%s "$FULLZIP" 2>/dev/null || echo 0)
-                if [ "$SIZE" -gt 2044723200 ]; then
-                  echo "ZIP larger than 1950 MiB, splitting"
-                  rm "$FULLZIP"
-                  zip -j -s 1950m "$OUTPUT_FOLDER/${fname}.zip" "$f"
-                fi
-              else
-                zip -j -s 99m "$OUTPUT_FOLDER/${fname}.zip" "$f"
-              fi
-              rm "$f"
-            done
-          fi
-          echo "✅ Zip phase complete."
-          echo "📁 Final contents of $OUTPUT_FOLDER:"
-          ls -lah "$OUTPUT_FOLDER"
-
-      # ── Prepare asset list (for release method) ───────────
-      - name: '📋 Prepare asset list'
-        run: |
-          ls -1 youtube > youtube_assets.txt
-          echo "Assets to upload:"
-          cat youtube_assets.txt
-
-      # ── Upload to repository (split_push) ────────────────
-      - name: '📤 Commit & Push Changes'
-        if: ${{ github.event.inputs.upload_as_release == 'false' }}
-        run: |
-          set -e
-          OUTPUT_FOLDER="youtube"
-          FILE_COUNT=$(ls -1 "$OUTPUT_FOLDER" 2>/dev/null | wc -l)
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "❌ No files to commit – aborting push."
-            exit 1
-          fi
-          echo "📤 Preparing to commit $FILE_COUNT file(s) from '$OUTPUT_FOLDER'..."
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config http.postBuffer 524288000
-          git add "$OUTPUT_FOLDER/"
-          if git diff --cached --quiet; then
-            echo "⚠️ No changes staged – nothing to commit."
-            exit 1
-          fi
-          git diff --cached --stat
-          git commit -m "⬇️ YouTube download [skip ci]"
-          RETRIES=5
-          for i in $(seq 1 $RETRIES); do
-            echo "📤 Push attempt $i..."
-            git pull --rebase --autostash origin "${{ github.ref_name }}"
-            if git push origin "${{ github.ref_name }}"; then
-              echo "✅ Push succeeded"
-              break
-            else
-              if [ $i -lt $RETRIES ]; then
-                echo "⏳ Push rejected, retrying in 3s..."
-                sleep 3
-              else
-                echo "❌ Push failed after $RETRIES attempts"
-                exit 1
-              fi
-            fi
-          done
-          echo "✅ All files uploaded to the 'youtube' folder."
-
-      # ── Create GitHub Release (release method) ────────────
-      - name: '🚀 Create Release and upload assets'
-        if: ${{ github.event.inputs.upload_as_release == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          OUTPUT_DIR="youtube"
-          if [ ! -s youtube_assets.txt ]; then
-            echo "No assets to release."
-            exit 0
-          fi
-          RAND5=$(tr -dc 'a-z' </dev/urandom | head -c5)
-          TAG="youtube-downloader-${RAND5}"
-          echo "Creating release tag: $TAG"
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git tag "$TAG" -m "YouTube download release"
-          git push origin "$TAG"
-          ASSET_ARGS=""
-          while IFS= read -r file; do
-            ASSET_ARGS="$ASSET_ARGS ${OUTPUT_DIR}/$file"
-          done < youtube_assets.txt
-          gh release create "$TAG" $ASSET_ARGS \
-            --title "youtube-downloader-${RAND5}" \
-            --notes "Automated release from YouTube Download workflow." \
-            --target "${{ github.ref_name }}"
-          echo "Release '$TAG' created with assets."
-
-      # ── Cleanup temporary directory ───────────────────────
-      - name: '🧹 Cleanup temp directory'
-        if: always()
-        run: |
-          rm -rf "${{ steps.tempdir.outputs.TEMP_DIR }}" 2>/dev/null || true
-          rm -f youtube-cookies.txt 2>/dev/null || true
-          echo "✅ Cleanup done."
+          # Move metadata JSON files (NEW)
+          mv "$TEMP_DIR"/*.json "$FINAL
